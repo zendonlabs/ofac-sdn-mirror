@@ -1,0 +1,115 @@
+# Publish as .github/workflows/ofac-mirror.yml in the public repository zendonlabs/ofac-sdn-mirror.
+# Copies the official OFAC SLS sdn.xml bytes unchanged. No secrets, no signing keys, no Aeonport credentials.
+# GitHub custody is a transport, not provenance proof; the Aeonport platform re-parses and re-gates every byte.
+name: OFAC SDN mirror
+on:
+  schedule:
+    # Every six hours, 43 minutes before the platform's 00/06/12/18 UTC source read.
+    - cron: '17 5,11,17,23 * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: ofac-sdn-mirror
+  cancel-in-progress: false
+jobs:
+  mirror:
+    if: github.repository == 'zendonlabs/ofac-sdn-mirror' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      # d23441a48e516b6c34aea4fa41551a30e30af803 is refs/tags/v6 (and v6.1.0) of actions/checkout, checked upstream by the coordinator 2026-11-08.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: true
+      - name: Download, check and publish
+        env:
+          RUN_ID: ${{ github.run_id }}
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::OFAC mirror refused: $1; nothing was committed"; exit 1; }
+          SRC='https://sanctionslistservice.ofac.treas.gov/api/PublicationPreview/exports/sdn.xml'
+          HOST='wc2h-sls-prod-public-published.s3.us-gov-west-1.amazonaws.com'
+          UA='ofac-sdn-mirror/1.0 (GitHub Actions; https://github.com/zendonlabs/ofac-sdn-mirror)'
+          work="$RUNNER_TEMP/ofac"; mkdir -p "$work"
+          [[ "$RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]] || fail 'run id'
+
+          # 1. Fixed official URL; exactly one redirect, only to the official S3 published host and path.
+          first=$(curl --proto '=https' --tlsv1.2 -sS -o /dev/null --max-time 60 -A "$UA" -H 'Accept: application/xml' -w '%{http_code} %{redirect_url}' "$SRC") || fail 'official request'
+          status=${first%% *}; location=${first#* }
+          [[ "$status" =~ ^30[12378]$ ]] || fail "official status $status"
+          echo "::add-mask::$location"
+          # Path must be /Published/<segments> with no dot, empty, encoded-dot/slash/backslash or backslash segments.
+          python3 -I -c 'import re,sys,urllib.parse as u;l,h=sys.argv[1:3];p=u.urlsplit(l);s=p.path.split("/");ok=l.startswith("https://"+h+"/Published/") and "#" not in l and "\\" not in l and p.scheme=="https" and p.hostname==h and p.port is None and p.username is None and p.password is None and not re.search(r"%(2e|2f|5c)",p.path,re.I) and len(s)>=3 and s[0]=="" and s[1]=="Published" and all(x not in ("",".","..") for x in s[1:]);sys.exit(0 if ok else 1)' "$location" "$HOST" || fail 'redirect outside the official published host'
+          second=$(curl --proto '=https' --tlsv1.2 -sS --max-redirs 0 --max-filesize 50000000 --max-time 300 -A "$UA" -H 'Accept: application/xml' -o "$work/sdn.xml" -w '%{http_code} %{content_type}' "$location") || fail 'published download'
+          [[ "${second%% *}" == 200 ]] || fail "published status ${second%% *}"
+          [[ "${second#* }" =~ ^(application|text)/([a-z0-9.+-]+\+)?xml([[:space:]]*\;|$) ]] || fail 'published content type'
+          fetched_at=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
+
+          # 2. Sanity: well-formed XML without DTD, one Publish_Date, declared Record_Count equals entries > 0.
+          python3 -I - "$work/sdn.xml" "$work/manifest.json" "$fetched_at" "$SRC" "$HOST" "$RUN_ID" <<'PY' || fail 'sanity check'
+          import hashlib, json, re, sys, xml.etree.ElementTree as ET
+          path, out, fetched_at, src, host, run_id = sys.argv[1:]
+          data = open(path, 'rb').read()
+          assert 0 < len(data) <= 50_000_000
+          assert b'<!DOCTYPE' not in data and b'<!ENTITY' not in data
+          ns = 'https://sanctionslistservice.ofac.treas.gov/api/PublicationPreview/exports/XML'
+          local = lambda tag: tag.rsplit('}', 1)[-1]
+          depth, entries, publish, declared, info, root_ok = 0, 0, [], [], 0, False
+          for event, el in ET.iterparse(path, events=('start', 'end')):
+              if event == 'start':
+                  depth += 1
+                  if depth == 1:
+                      root_ok = local(el.tag) == 'sdnList' and (el.tag == 'sdnList' or el.tag == '{' + ns + '}sdnList')
+                  continue
+              name = local(el.tag)
+              if depth == 2 and name == 'sdnEntry':
+                  entries += 1
+              if depth == 2 and name == 'publshInformation':
+                  info += 1
+              if depth == 3 and name == 'Publish_Date':
+                  publish.append((el.text or '').strip())
+              if depth == 3 and name == 'Record_Count':
+                  declared.append((el.text or '').strip())
+              depth -= 1
+              if depth <= 1:
+                  el.clear()
+          assert root_ok and info == 1 and len(publish) == 1 and len(declared) == 1
+          m = re.fullmatch(r'(\d{2})/(\d{2})/(\d{4})', publish[0])
+          assert m and re.fullmatch(r'[1-9][0-9]{0,5}', declared[0])
+          assert entries > 0 and entries == int(declared[0])
+          manifest = {'fetched_at': fetched_at, 'source_url': src, 'final_host': host,
+                      'sha256': hashlib.sha256(data).hexdigest(), 'bytes': len(data),
+                      'publish_date': f'{m[3]}-{m[1]}-{m[2]}', 'entry_count': entries, 'run_id': run_id}
+          open(out, 'w').write(json.dumps(manifest, indent=2, sort_keys=True) + '\n')
+          print(f"publish_date={manifest['publish_date']} entries={entries} bytes={len(data)} sha256={manifest['sha256']}")
+          PY
+
+          # 3. Data branch: sdn.xml changes start a fresh one-version history (no bloat); otherwise append manifest only.
+          sha=$(python3 -I -c 'import json,sys;print(json.load(open(sys.argv[1]))["sha256"])' "$work/manifest.json")
+          prev=''; prev_sha=''
+          if git ls-remote --exit-code --heads origin data >/dev/null; then
+            git fetch --quiet --depth=1 origin data
+            prev=$(git rev-parse FETCH_HEAD)
+            prev_sha=$(git show FETCH_HEAD:sdn.xml | sha256sum | cut -d' ' -f1)
+          fi
+          man=$(git hash-object -w "$work/manifest.json")
+          if [[ "$sha" != "$prev_sha" ]]; then
+            xml=$(git hash-object -w "$work/sdn.xml")
+            tree=$(printf '100644 blob %s\tmanifest.json\n100644 blob %s\tsdn.xml\n' "$man" "$xml" | git mktree)
+            commit=$(git commit-tree "$tree" -m "OFAC SDN $sha run $RUN_ID")
+            git push --quiet --force-with-lease="refs/heads/data:$prev" origin "$commit:refs/heads/data"
+            echo "Published new sdn.xml $sha"
+          else
+            xml=$(git rev-parse FETCH_HEAD:sdn.xml)
+            tree=$(printf '100644 blob %s\tmanifest.json\n100644 blob %s\tsdn.xml\n' "$man" "$xml" | git mktree)
+            commit=$(git commit-tree "$tree" -p "$prev" -m "OFAC SDN manifest run $RUN_ID")
+            git push --quiet origin "$commit:refs/heads/data"
+            echo "Unchanged sdn.xml $sha; manifest refreshed"
+          fi
