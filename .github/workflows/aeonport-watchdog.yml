@@ -1,0 +1,36 @@
+# Aeonport outside watchdog (owner 2026-11-10: global-impact failures must alert).
+# Runs on GitHub, independent of Cloudflare and of the owner's Mac. A failed run makes GitHub email the repository owner.
+# Read-only: public GET requests only. No secrets, no write permissions.
+name: Aeonport watchdog
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: aeonport-watchdog
+  cancel-in-progress: true
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Site and sanctions list
+        shell: bash
+        run: |
+          set -euo pipefail
+          UA='aeonport-watchdog/1.0 (GitHub Actions; https://github.com/zendonlabs/ofac-sdn-mirror)'
+          code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 -A "$UA" https://aeonport.com/api/config) || { echo "::error::aeonport.com unreachable"; exit 1; }
+          [[ "$code" == 200 ]] || { echo "::error::aeonport.com /api/config returned $code"; exit 1; }
+          curl -sS --max-time 30 -A "$UA" https://aeonport.com/api/sanctions/health -o health.json || { echo "::error::sanctions health unreachable"; exit 1; }
+          python3 -I -c 'import json,sys,datetime as d
+          h=json.load(open("health.json"))
+          now=d.datetime.now(d.timezone.utc)
+          at=h.get("checked_at")
+          age=(now-d.datetime.fromisoformat(at.replace("Z","+00:00"))).total_seconds()/3600 if at else None
+          print("status=%s reason=%s checked_at=%s age_h=%s list_date=%s" % (h.get("status"),h.get("reason"),at,None if age is None else round(age,1),h.get("list_date")))
+          problems=[]
+          if h.get("status")!="CURRENT": problems.append("sanctions list %s (%s): new real-money orders are closed" % (h.get("status"),h.get("reason")))
+          if age is None or age>8: problems.append("sanctions list last checked %s hours ago (expected every 6 hours)" % (None if age is None else round(age,1)))
+          for p in problems: print("::error::"+p)
+          sys.exit(1 if problems else 0)'
