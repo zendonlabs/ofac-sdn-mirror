@@ -39,7 +39,7 @@ jobs:
           warnings=[]
           status,reason=h.get("status"),h.get("reason")
           message="sanctions list status %s (%s): check the platform" % (status,reason)
-          if status=="STALE" or "STALE" in str(reason): warnings.append(message)
+          if status=="STALE": warnings.append(message)
           elif status!="CURRENT": problems.append(message)
           if status=="CURRENT" and (age is None or age>8): warnings.append("sanctions list last checked %s hours ago; reminder only, screening continues on the last valid list" % (None if age is None else round(age,1)))
           for w in warnings: print("::warning::"+w)
