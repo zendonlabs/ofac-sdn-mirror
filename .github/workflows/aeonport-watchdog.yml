@@ -1,47 +1,203 @@
-# Aeonport outside watchdog (2026-11-13 owner ruling).
-# 「旧版看门狗"名单 6 小时内必须查过"的规则今天就改为现行规则：名单过旧只提醒、不判失败，不等完整外部体检。」
-# Runs on GitHub, independent of Cloudflare and of the owner's Mac. A failed run makes GitHub email the repository owner.
-# Read-only: public GET requests only. No secrets, no write permissions.
+# Dispatch #399 merged workflow. Install as .github/workflows/aeonport-watchdog.yml in zendonlabs/ofac-sdn-mirror,
+# with outside-check.mjs at ops/outside-check/outside-check.mjs. Replaces the old watchdog; no second schedule.
+# Kept from the old watchdog (2026-11-13 owner ruling): a stale sanctions list is a warning only, never a failure.
+# Name kept as "Aeonport watchdog" so the patrol rule (failed runs of "Aeonport watchdog") and run history stay valid.
+# Missing NTFY_TOPIC / PROBE_WALLET_KEY never fail the run; issues are still opened/updated/commented on recovery.
 name: Aeonport watchdog
 on:
   schedule:
     - cron: '23 * * * *'
   workflow_dispatch:
-permissions: {}
+    inputs:
+      operation:
+        type: choice
+        options: [check, enroll]
+        default: check
+      force_failure:
+        description: Exercise failure notifications without breaking the site
+        type: boolean
+        default: false
+permissions:
+  contents: read
+  issues: write
 concurrency:
   group: aeonport-watchdog
-  cancel-in-progress: true
+  cancel-in-progress: false
 jobs:
   check:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 12
     steps:
-      - name: Site and sanctions list
-        shell: bash
+      - id: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        id: node
+        with:
+          node-version: '24'
+      - name: Standard wallet signing library
+        id: wallet
+        run: npm install --no-save --ignore-scripts --package-lock=false viem@2.57.7
+      - name: Enroll dedicated test Agent (one-off)
+        if: inputs.operation == 'enroll'
+        env:
+          GH_TOKEN: ${{ secrets.PROBE_SETUP_TOKEN }}
+          PROBE_WALLET_KEY: ${{ secrets.PROBE_WALLET_KEY }}
+        run: node ops/outside-check/outside-check.mjs --enroll
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        id: state
+        if: always() && inputs.operation != 'enroll'
+        with:
+          path: outside-state
+          key: aeonport-outside-v2-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: aeonport-outside-v2-
+      - name: Public health and real Agent write/read
+        id: probe
+        if: always() && inputs.operation != 'enroll'
+        env:
+          PROBE_WALLET_KEY: ${{ secrets.PROBE_WALLET_KEY }}
+          PROBE_FORCE_FAILURE: ${{ inputs.force_failure == true }}
+          PROBE_INFRA_FAILURE: ${{ steps.node.outcome == 'failure' || steps.wallet.outcome == 'failure' || steps.state.outcome == 'failure' }}
+        run: node ops/outside-check/outside-check.mjs
+      # Inline by design: checkout, dependency or probe failure must still create an issue.
+      - name: Record issues and send tiered phone notifications
+        id: notify
+        if: always() && inputs.operation != 'enroll'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          PROBE_EXECUTED: ${{ steps.probe.outputs.started_at != '' }}
+          PROBE_INFRA_FAILURE: ${{ steps.checkout.outcome != 'success' || steps.node.outcome != 'success' || steps.wallet.outcome != 'success' || steps.state.outcome == 'failure' || steps.probe.outcome != 'success' }}
         run: |
-          set -euo pipefail
-          UA='aeonport-watchdog/1.0 (GitHub Actions; https://github.com/zendonlabs/ofac-sdn-mirror)'
-          code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 -A "$UA" https://aeonport.com/api/config) || { echo "::error::aeonport.com unreachable"; exit 1; }
-          [[ "$code" == 200 ]] || { echo "::error::aeonport.com /api/config returned $code"; exit 1; }
-          curl -sS --max-time 30 -A "$UA" https://aeonport.com/api/sanctions/health -o health.json || { echo "::error::sanctions health unreachable"; exit 1; }
-          python3 -I -c 'import json,sys,datetime as d
-          try:
-              with open("health.json") as f: h=json.load(f)
-              if not isinstance(h,dict): raise ValueError("expected a JSON object")
-              now=d.datetime.now(d.timezone.utc)
-              at=h.get("checked_at")
-              age=(now-d.datetime.fromisoformat(at.replace("Z","+00:00"))).total_seconds()/3600 if at else None
-          except (OSError,ValueError,TypeError,AttributeError) as e:
-              print("::error::sanctions health unreadable: %s" % e)
-              sys.exit(1)
-          print("status=%s reason=%s checked_at=%s age_h=%s list_date=%s" % (h.get("status"),h.get("reason"),at,None if age is None else round(age,1),h.get("list_date")))
-          problems=[]
-          warnings=[]
-          status,reason=h.get("status"),h.get("reason")
-          message="sanctions list status %s (%s): check the platform" % (status,reason)
-          if status=="STALE": warnings.append(message)
-          elif status!="CURRENT": problems.append(message)
-          if status=="CURRENT" and (age is None or age>8): warnings.append("sanctions list last checked %s hours ago; reminder only, screening continues on the last valid list" % (None if age is None else round(age,1)))
-          for w in warnings: print("::warning::"+w)
-          for p in problems: print("::error::"+p)
-          sys.exit(1 if problems else 0)'
+          node --input-type=module <<'JS'
+          import {mkdir,readFile,writeFile,appendFile} from 'node:fs/promises';
+          const env=process.env,dir='outside-state',at=new Date(env.PROBE_NOW||Date.now()).toISOString();
+          // Closed vocabulary only: no response/error text or secret can reach notifications/evidence.
+          const messages={
+            sanctions:['名单状态异常','是','请打开电脑和总协调会话'],
+            config:['网站打不开','否','请打开电脑和总协调会话'],
+            agent_probe:['外部 Agent 登录或读写失败','否','请打开电脑和总协调会话'],
+            workflow:['外部检查未能运行','否','请打开电脑和总协调会话'],
+            history_state:['外部检查的历史记录无法读取','否','请打开电脑和总协调会话'],
+            forced_failure:['外部检查演练失败','否','无'],
+            notifications:['外部检查的通知发送失败','否','请打开电脑和总协调会话']
+          };
+          await mkdir(dir,{recursive:true});
+          const load=async(file,fallback)=>{try{return JSON.parse(await readFile(file,'utf8'));}catch(e){if(e.code==='ENOENT')return fallback;throw Error('STATE_INVALID');}};
+          const save=(file,value)=>writeFile(dir+'/'+file,JSON.stringify(value,null,2)+'\n');
+          let results={},state,history=[],deliveryFailed=false;
+          try{
+            if(env.PROBE_EXECUTED==='true'){
+              const report=await load('outside-result.json',null);
+              if(!report||!report.results||Object.entries(report.results).some(([name,r])=>!Object.hasOwn(messages,name)||typeof r?.ok!=='boolean'))throw Error('RESULT_INVALID');
+              results=report.results;
+            }else results.workflow={ok:false};
+          }catch{results.workflow={ok:false};}
+          if(env.PROBE_INFRA_FAILURE==='true')results.workflow={ok:false};
+          else if(env.PROBE_EXECUTED==='true'&&env.PROBE_INFRA_FAILURE==='false'&&!results.workflow)results.workflow={ok:true};
+          try{
+            state=await load(dir+'/state.json',{last_good:null,incident:null,checks:{}});
+            if(!state||typeof state.checks!=='object'||!state.checks)throw Error('STATE_INVALID');
+            history=await load(dir+'/history.json',[]);if(!Array.isArray(history))throw Error('STATE_INVALID');
+            results.history_state={ok:true};
+          }catch{state={last_good:null,incident:null,checks:{}};history=[];results.history_state={ok:false};}
+          const failed=Object.keys(messages).filter(name=>results[name]?.ok===false);
+          const recovered=Object.keys(messages).filter(name=>name!=='notifications'&&results[name]?.ok===true&&(state.checks[name]?.consecutive_failures||0)>0);
+          // Only this repository's workflow token; no PAT, cross-repository token or stored issue ids.
+          const root='https://api.github.com/repos/zendonlabs/ofac-sdn-mirror';
+          async function github(path,method='GET',body){
+            const response=await fetch(root+path,{method,headers:{Accept:'application/vnd.github+json',Authorization:'Bearer '+env.GITHUB_TOKEN,'X-GitHub-Api-Version':'2022-11-28',...(body?{'Content-Type':'application/json'}:{})},...(body?{body:JSON.stringify(body)}:{}),redirect:'error',signal:AbortSignal.timeout(20000)});
+            if(!response.ok)throw Error('ISSUE_WRITE_FAILED');return response.json();
+          }
+          const title=name=>'Aeonport 外部检查故障：'+name;
+          let open=[];
+          try{
+            // Ensure the label exists even on the first installation.
+            const label=await fetch(root+'/labels/'+encodeURIComponent('故障'),{headers:{Authorization:'Bearer '+env.GITHUB_TOKEN},redirect:'error',signal:AbortSignal.timeout(20000)});
+            if(label.status===404)await github('/labels','POST',{name:'故障',color:'d73a4a'});else if(!label.ok)throw Error('LABEL_FAILED');
+            for(let page=1;;page++){
+              const batch=await github('/issues?state=open&labels='+encodeURIComponent('故障')+'&per_page=100&page='+page);
+              open.push(...batch.filter(issue=>!issue.pull_request));if(batch.length<100)break;
+            }
+            for(const name of [...failed,...recovered]){
+              try{
+                const issue=open.find(issue=>issue.title===title(name)),body=`步骤：${name}\n${failed.includes(name)?'失败':'已恢复'}\nUTC 时间：${at}`;
+                if(issue)await github('/issues/'+issue.number+'/comments','POST',{body});
+                else if(failed.includes(name))open.push(await github('/issues','POST',{title:title(name),labels:['故障'],body}));
+                if(recovered.includes(name))state.checks[name].consecutive_failures=0;
+              }catch{deliveryFailed=true;}
+            }
+          }catch{deliveryFailed=true;}
+          const previous=state.incident;
+          let pending=null;
+          if(failed.length){
+            if(state.incident?.recovered_at)state.incident=null;
+            state.incident??={started_at:at,last_good:state.last_good,consecutive_failures:0,last_push:null,primary:failed[0]};
+            state.incident.consecutive_failures++;
+            // Remember the most relevant money-related failure for the eventual recovery message.
+            if(failed.includes('sanctions'))state.incident.primary='sanctions';
+            if(state.incident.consecutive_failures>=2&&(!state.incident.last_push||Date.parse(at)-Date.parse(state.incident.last_push)>=21600000))pending='failure';
+          }else if(!Object.entries(state.checks).some(([name,check])=>name!=='notifications'&&check.consecutive_failures>0)&&(!state.incident||results[state.incident.primary]?.ok===true)){
+            state.last_good=at;
+            if(state.incident){state.incident.recovered_at??=at;pending='recovery';}
+          }
+          // A missing topic never prevents issue writes and never produces a green configuration check.
+          // 2026-11-13 #399: an absent topic is "not installed yet" (owner sets it on 11-15): skip push, do not fail the run.
+          if(!/^[a-f0-9]{48,}$/.test(env.NTFY_TOPIC||'')){console.log(env.NTFY_TOPIC?'NTFY_TOPIC_INVALID_PUSH_SKIPPED':'NTFY_TOPIC_NOT_SET_PUSH_SKIPPED');}
+          else if(pending){
+            const name=pending==='failure'?failed[0]:state.incident.primary;
+            const [sentence,money,action]=messages[name]||messages.workflow;
+            const body=[sentence+(pending==='recovery'?'，现已恢复':''),'涉及真钱：'+money,'需要你做的：'+(pending==='recovery'?'无':action)].join('\n');
+            const text=pending==='failure'?'Aeonport 外部检查失败':'Aeonport 外部检查已恢复';
+            try{
+              // RFC 2047 title: fetch Headers accepts bytes, not raw Chinese header values.
+              const response=await fetch('https://ntfy.sh/'+env.NTFY_TOPIC,{method:'POST',headers:{Title:'=?UTF-8?B?'+Buffer.from(text).toString('base64')+'?=','Content-Type':'text/plain; charset=utf-8'},body,redirect:'error',signal:AbortSignal.timeout(20000)});
+              if(!response.ok)throw Error('PUSH_FAILED');
+              if(pending==='recovery')state.incident=null;else state.incident.last_push=at;
+            }catch{deliveryFailed=true;console.log('NTFY_DELIVERY_FAILED');}
+          }
+          if(!deliveryFailed&&(state.checks.notifications?.consecutive_failures||0)>0){
+            try{
+              const issue=open.find(issue=>issue.title===title('notifications'));
+              if(issue)await github('/issues/'+issue.number+'/comments','POST',{body:`步骤：notifications\n已恢复\nUTC 时间：${at}`});
+              state.checks.notifications.consecutive_failures=0;
+            }catch{deliveryFailed=true;}
+          }
+          if(deliveryFailed){
+            results.notifications={ok:false};
+            try{
+              const issue=open.find(issue=>issue.title===title('notifications'));
+              const body=`步骤：notifications\n失败\nUTC 时间：${at}`;
+              if(issue)await github('/issues/'+issue.number+'/comments','POST',{body});
+              else await github('/issues','POST',{title:title('notifications'),labels:['故障'],body});
+            }catch{console.log('GITHUB_ISSUE_DELIVERY_FAILED');}
+          }
+          for(const [name,result]of Object.entries(results)){
+            const old=state.checks[name]||{};
+            // Retain an unacknowledged recovery comment for retry on the next run.
+            if(!result.ok)state.checks[name]={consecutive_failures:(old.consecutive_failures||0)+1,last_good:old.last_good||null};
+            else state.checks[name]={...old,last_good:at,consecutive_failures:old.consecutive_failures||0};
+          }
+          const report={started_at:at,results,incident_start:state.incident?.started_at||previous?.started_at||null,last_good:state.last_good};
+          history.push(report);await save('state.json',state);await save('history.json',history.slice(-168));
+          const summary=`UTC 时间：${at}\n失败步骤：${failed.join(', ')||'无'}\n通知：${deliveryFailed?'失败':'完成'}\n`;
+          if(env.GITHUB_STEP_SUMMARY)await appendFile(env.GITHUB_STEP_SUMMARY,summary);
+          if(env.GITHUB_OUTPUT)await appendFile(env.GITHUB_OUTPUT,'failed='+String(failed.length>0||deliveryFailed)+'\n');
+          console.log(summary);process.exitCode=failed.length||deliveryFailed?1:0;
+          JS
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4; saves failed runs too
+        if: always() && inputs.operation != 'enroll'
+        with:
+          path: outside-state
+          key: aeonport-outside-v2-${{ github.run_id }}-${{ github.run_attempt }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always() && inputs.operation != 'enroll'
+        with:
+          name: outside-check-${{ github.run_id }}-${{ github.run_attempt }}
+          path: outside-state/
+          retention-days: 14
+          if-no-files-found: error
+      - name: Surface failed checks in GitHub job status
+        if: always() && (steps.probe.outputs.failed == 'true' || steps.notify.outcome == 'failure')
+        run: exit 1
