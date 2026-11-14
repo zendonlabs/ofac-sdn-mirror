@@ -1,4 +1,5 @@
-# Aeonport outside watchdog (owner 2026-11-10: global-impact failures must alert).
+# Aeonport outside watchdog (2026-11-13 owner ruling).
+# 「旧版看门狗"名单 6 小时内必须查过"的规则今天就改为现行规则：名单过旧只提醒、不判失败，不等完整外部体检。」
 # Runs on GitHub, independent of Cloudflare and of the owner's Mac. A failed run makes GitHub email the repository owner.
 # Read-only: public GET requests only. No secrets, no write permissions.
 name: Aeonport watchdog
@@ -24,13 +25,23 @@ jobs:
           [[ "$code" == 200 ]] || { echo "::error::aeonport.com /api/config returned $code"; exit 1; }
           curl -sS --max-time 30 -A "$UA" https://aeonport.com/api/sanctions/health -o health.json || { echo "::error::sanctions health unreachable"; exit 1; }
           python3 -I -c 'import json,sys,datetime as d
-          h=json.load(open("health.json"))
-          now=d.datetime.now(d.timezone.utc)
-          at=h.get("checked_at")
-          age=(now-d.datetime.fromisoformat(at.replace("Z","+00:00"))).total_seconds()/3600 if at else None
+          try:
+              with open("health.json") as f: h=json.load(f)
+              if not isinstance(h,dict): raise ValueError("expected a JSON object")
+              now=d.datetime.now(d.timezone.utc)
+              at=h.get("checked_at")
+              age=(now-d.datetime.fromisoformat(at.replace("Z","+00:00"))).total_seconds()/3600 if at else None
+          except (OSError,ValueError,TypeError,AttributeError) as e:
+              print("::error::sanctions health unreadable: %s" % e)
+              sys.exit(1)
           print("status=%s reason=%s checked_at=%s age_h=%s list_date=%s" % (h.get("status"),h.get("reason"),at,None if age is None else round(age,1),h.get("list_date")))
           problems=[]
-          if h.get("status")!="CURRENT": problems.append("sanctions list %s (%s): new real-money orders are closed" % (h.get("status"),h.get("reason")))
-          if age is None or age>8: problems.append("sanctions list last checked %s hours ago (expected every 6 hours)" % (None if age is None else round(age,1)))
+          warnings=[]
+          status,reason=h.get("status"),h.get("reason")
+          message="sanctions list status %s (%s): check the platform" % (status,reason)
+          if status=="STALE" or "STALE" in str(reason): warnings.append(message)
+          elif status!="CURRENT": problems.append(message)
+          if status=="CURRENT" and (age is None or age>8): warnings.append("sanctions list last checked %s hours ago; reminder only, screening continues on the last valid list" % (None if age is None else round(age,1)))
+          for w in warnings: print("::warning::"+w)
           for p in problems: print("::error::"+p)
           sys.exit(1 if problems else 0)'
