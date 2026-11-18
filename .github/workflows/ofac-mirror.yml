@@ -1,5 +1,5 @@
 # Publish as .github/workflows/ofac-mirror.yml in the public repository zendonlabs/ofac-sdn-mirror.
-# Copies the official OFAC SLS sdn.xml bytes unchanged. No secrets, no signing keys, no Aeonport credentials.
+# Copies the official OFAC SLS sdn.xml bytes unchanged. The download and publish step uses no secrets.
 # GitHub custody is a transport, not provenance proof; the Aeonport platform re-parses and re-gates every byte.
 name: OFAC SDN mirror
 on:
@@ -24,6 +24,7 @@ jobs:
           fetch-depth: 1
           persist-credentials: true
       - name: Download, check and publish
+        id: publish
         env:
           RUN_ID: ${{ github.run_id }}
           GIT_AUTHOR_NAME: github-actions[bot]
@@ -113,3 +114,26 @@ jobs:
             git push --quiet origin "$commit:refs/heads/data"
             echo "Unchanged sdn.xml $sha; manifest refreshed"
           fi
+      - name: Notify the operator of mirror failure
+        if: ${{ failure() && steps.publish.outcome == 'failure' }}
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        shell: bash
+        run: |
+          node --input-type=module <<'JS'
+          try {
+            const topic = process.env.NTFY_TOPIC || '';
+            if (!/^[a-f0-9]{48,}$/.test(topic)) throw Error('Missing operator topic');
+            const response = await fetch('https://ntfy.sh/' + topic, {
+              method: 'POST',
+              headers: {Title: 'Aeonport OFAC mirror failure', 'Content-Type': 'text/plain; charset=utf-8'},
+              body: 'The Treasury list mirror run failed. Open the OFAC SDN mirror workflow to check the failure.',
+              redirect: 'error',
+              signal: AbortSignal.timeout(20000)
+            });
+            if (!response.ok) throw Error('Notification refused');
+          } catch {
+            console.error('OFAC_MIRROR_NOTIFICATION_FAILED');
+            process.exitCode = 1;
+          }
+          JS
