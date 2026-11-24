@@ -1,0 +1,10 @@
+{
+  "bytes": 29657739,
+  "entry_count": 19629,
+  "fetched_at": "2026-11-24T03:20:12.127Z",
+  "final_host": "wc2h-sls-prod-public-published.s3.us-gov-west-1.amazonaws.com",
+  "publish_date": "2026-11-23",
+  "run_id": "45318752187",
+  "sha256": "6ffb23f8c0b92518f15317010ec1d41a96bda876760690e5c76da8f38221e0a9",
+  "source_url": "https://sanctionslistservice.ofac.treas.gov/api/PublicationPreview/exports/sdn.xml"
+}
